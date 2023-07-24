@@ -4,7 +4,6 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::RwLock,
 };
 
 use anyhow::{anyhow, Result};
@@ -14,6 +13,7 @@ use milli::{
     heed, update, Criterion, Index, Search, SearchResult,
 };
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 
 // The following constants are for the map size used in heed/LMDB.
 // We assume any OS we run on will have a page size less than 16 MiB (2^24)
@@ -88,7 +88,7 @@ impl Instance {
 
     pub fn get_index(&self, name: impl AsRef<str>) -> Result<EmbeddedMilli> {
         let dir = self.instance_dir.join(name.as_ref());
-        if let Some(index) = INDEXES.read().unwrap().get(&dir) {
+        if let Some(index) = INDEXES.read().get(&dir) {
             return Ok(index.clone());
         }
         std::fs::create_dir_all(&dir)?;
@@ -123,7 +123,7 @@ impl Instance {
 
         let index = Index::new(options, &dir).map_err(anyhow::Error::from)?;
         let res = EmbeddedMilli { index };
-        INDEXES.write().unwrap().insert(dir, res.clone());
+        INDEXES.write().insert(dir, res.clone());
         Ok(res)
     }
 }

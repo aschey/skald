@@ -12,7 +12,8 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use skald::{
     embedded_milli::{IndexSettings, Instance},
-    PrimaryKeyFn, SqliteMilliConnectionManager, StatementExt, TableIndexSettings,
+    pool::SkaldConnectionManager,
+    PrimaryKeyFn, StatementExt, TableIndexSettings,
 };
 use slite::Migrator;
 
@@ -74,7 +75,7 @@ fn main() {
         .unwrap();
     println!("RES0 {res:?}");
 
-    let manager = SqliteMilliConnectionManager::new(manager, instance).with_table(
+    let manager = SkaldConnectionManager::new(manager, instance).with_table(
         "artist".to_owned(),
         vec![TableIndexSettings {
             index_name: "artist".to_owned(),
