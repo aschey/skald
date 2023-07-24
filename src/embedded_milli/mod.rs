@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    convert::TryInto,
     fs,
     io::Cursor,
     path::{Path, PathBuf},
@@ -12,8 +11,7 @@ use anyhow::{anyhow, Result};
 use derivative::Derivative;
 use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
-    heed, update, AscDesc, Criterion, Filter, Index, Member, Search, SearchResult,
-    TermsMatchingStrategy,
+    heed, update, Criterion, Index, Search, SearchResult,
 };
 use once_cell::sync::Lazy;
 
@@ -189,7 +187,7 @@ impl EmbeddedMilli {
         Ok(())
     }
 
-    pub fn delete_all_documents<'t>(&'t self, wtxn: &'t mut heed::RwTxn<'t, '_>) -> Result<()> {
+    pub fn delete_all_documents<'t>(&'t self, wtxn: &mut heed::RwTxn<'t, '_>) -> Result<()> {
         let builder = update::ClearDocuments::new(wtxn, &self.index);
         builder.execute()?;
 
@@ -198,7 +196,7 @@ impl EmbeddedMilli {
 
     pub fn set_documents<'t>(
         &'t self,
-        wtxn: &'t mut heed::RwTxn<'t, '_>,
+        wtxn: &mut heed::RwTxn<'t, '_>,
         documents: Vec<Document>,
     ) -> Result<()> {
         // Delete all existing documents
@@ -268,34 +266,12 @@ impl EmbeddedMilli {
     pub fn search_documents(
         &self,
         rtxn: &heed::RoTxn,
-        query: Option<String>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-        sort_criteria: Option<Vec<AscDesc>>,
-        filter: Option<Filter>,
-        matching_strategy: Option<TermsMatchingStrategy>,
+        build_search: impl FnOnce(&mut Search),
     ) -> Result<Vec<Document>> {
         // Create the search
 
         let mut search = Search::new(rtxn, &self.index);
-
-        // Configure the search based on given parameters
-        search.limit(limit.unwrap_or(u32::MAX).try_into()?);
-        if let Some(offset) = offset {
-            search.offset(offset.try_into()?);
-        }
-        if let Some(query) = query {
-            search.query(query);
-        }
-        if let Some(ref filter) = filter {
-            search.filter(filter.clone());
-        }
-        if let Some(strat) = matching_strategy {
-            search.terms_matching_strategy(strat);
-        }
-        if let Some(criteria) = sort_criteria {
-            search.sort_criteria(criteria);
-        }
+        build_search(&mut search);
 
         // Get the documents based on the search results
         let SearchResult { documents_ids, .. } = search.execute()?;
@@ -328,17 +304,15 @@ impl EmbeddedMilli {
                 .criteria(rtxn)?
                 .into_iter()
                 .map(|rule| match rule {
-                    Criterion::Words => "words",
-                    Criterion::Typo => "typo",
-                    Criterion::Proximity => "proximity",
-                    Criterion::Attribute => "attribute",
-                    Criterion::Sort => "sort",
-                    Criterion::Exactness => "exactness",
-                    Criterion::Asc(_) => "",
-                    Criterion::Desc(_) => "",
+                    Criterion::Words => "words".to_owned(),
+                    Criterion::Typo => "typo".to_owned(),
+                    Criterion::Proximity => "proximity".to_owned(),
+                    Criterion::Attribute => "attribute".to_owned(),
+                    Criterion::Sort => "sort".to_owned(),
+                    Criterion::Exactness => "exactness".to_owned(),
+                    Criterion::Asc(val) => format!("{val}:asc"),
+                    Criterion::Desc(val) => format!("{val}:desc"),
                 })
-                .filter(|s| !s.is_empty())
-                .map(String::from)
                 .collect(),
             stop_words: self
                 .index

@@ -1,28 +1,23 @@
-use crossbeam::select;
-use dashmap::{mapref::entry::Entry, DashMap};
-use derivative::Derivative;
-use embedded_milli::Instance;
-use milli::{
-    documents::{DocumentsBatchBuilder, DocumentsBatchReader},
-    execute_search,
-    heed::EnvOpenOptions,
-    update::{IndexDocuments, IndexDocumentsConfig, IndexerConfig, Settings},
-    DefaultSearchLogger, GeoSortStrategy, Index, SearchContext, TermsMatchingStrategy,
+use crossbeam::{channel, select};
+use dashmap::{
+    mapref::entry::{Entry, OccupiedEntry},
+    DashMap,
 };
+use derivative::Derivative;
+use embedded_milli::{Document, Instance};
 use r2d2::ManageConnection;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{
     hooks::Action,
     preupdate_hook::{PreUpdateCase, PreUpdateOldValueAccessor},
-    types::FromSql,
-    Connection,
+    types::{FromSql, ValueRef},
+    Connection, Params, Statement,
 };
-use serde_json::Number;
 use std::{
     convert::Infallible,
-    io::Cursor,
-    sync::{Arc, Mutex, RwLock},
-    thread,
+    hash::Hash,
+    sync::{Arc, RwLock},
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -52,18 +47,20 @@ pub struct TableIndexSettings {
 pub struct SqliteMilliConnectionManager {
     inner: SqliteConnectionManager,
     table_settings: Arc<DashMap<String, Vec<TableIndexSettings>>>,
-    update_tx: crossbeam::channel::Sender<DashMap<String, Vec<TableUpdate>>>,
+    update_tx: channel::Sender<DashMap<String, Vec<TableUpdate>>>,
+    _updater_handle: JoinHandle<()>,
 }
 
 impl SqliteMilliConnectionManager {
     pub fn new(inner: SqliteConnectionManager, instance: Instance) -> Self {
-        let (update_tx, update_rx) = crossbeam::channel::unbounded();
+        let (update_tx, update_rx) = channel::unbounded();
         let conn = inner.connect().unwrap();
-        thread::spawn(move || index_updater(instance, update_rx, conn));
+        let handle = thread::spawn(move || index_updater(instance, update_rx, conn));
         Self {
             inner,
             table_settings: Default::default(),
             update_tx,
+            _updater_handle: handle,
         }
     }
 
@@ -86,9 +83,68 @@ pub enum TableUpdate {
     Upsert { rowid: i64, update_query: String },
 }
 
-pub fn index_updater(
+pub trait StatementExt {
+    fn query_to_json<P: Params>(&mut self, params: P) -> Vec<Document>;
+}
+
+impl StatementExt for Statement<'_> {
+    fn query_to_json<P: Params>(&mut self, params: P) -> Vec<Document> {
+        self.query_map(params, |row| {
+            let json_iter = (0..row.as_ref().column_count()).map(|col| {
+                let column_name = row.as_ref().column_name(col).unwrap().to_owned();
+                let sqlite_value_ref = row.get_ref_unwrap(col);
+
+                let json_value = match sqlite_value_ref {
+                    ValueRef::Text(sqlite_value) => {
+                        if !sqlite_value.starts_with(&[b'"'])
+                            && !sqlite_value.starts_with(&[b'{'])
+                            && !sqlite_value.starts_with(&[b'['])
+                        {
+                            serde_json::Value::from(std::str::from_utf8(sqlite_value).unwrap())
+                        } else {
+                            serde_json::Value::column_result(sqlite_value_ref)
+                                .or_else(|_| {
+                                    Ok::<_, Infallible>(serde_json::Value::from(
+                                        std::str::from_utf8(sqlite_value).unwrap(),
+                                    ))
+                                })
+                                .unwrap()
+                        }
+                    }
+                    _ => serde_json::Value::column_result(sqlite_value_ref).unwrap(),
+                };
+
+                (column_name, json_value)
+            });
+            Ok(serde_json::map::Map::from_iter(json_iter))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+}
+
+trait DashMapExt<K, V> {
+    fn get_or_insert_entry(&self, key: K) -> OccupiedEntry<'_, K, V>;
+}
+
+impl<K, V> DashMapExt<K, V> for DashMap<K, V>
+where
+    K: PartialEq + Eq + Hash + Clone,
+    V: Default,
+{
+    fn get_or_insert_entry(&self, key: K) -> OccupiedEntry<'_, K, V> {
+        let entry = self.entry(key);
+        match entry {
+            Entry::Occupied(o) => o,
+            Entry::Vacant(vacant) => vacant.insert_entry(V::default()),
+        }
+    }
+}
+
+fn index_updater(
     instance: Instance,
-    update_rx: crossbeam::channel::Receiver<DashMap<String, Vec<TableUpdate>>>,
+    update_rx: channel::Receiver<DashMap<String, Vec<TableUpdate>>>,
     connection: Connection,
 ) {
     loop {
@@ -99,10 +155,7 @@ pub fn index_updater(
                 recv(update_rx) -> msg => {
                     let msg = msg.unwrap();
                     for (key, val) in msg.into_iter() {
-                        let mut index_updates = match updates.entry(key) {
-                            Entry::Occupied(o) => o,
-                            Entry::Vacant(vacant) => vacant.insert_entry(vec![]),
-                        };
+                        let mut index_updates = updates.get_or_insert_entry(key);
                         index_updates.get_mut().extend(val);
                     }
 
@@ -131,44 +184,7 @@ pub fn index_updater(
 
             for (rowid, update_query) in upserts {
                 let mut statement = connection.prepare_cached(update_query).unwrap();
-                let docs: Vec<_> = statement
-                    .query_map([rowid], |row| {
-                        let mut row_map = serde_json::map::Map::new();
-                        for col in 0..row.as_ref().column_count() {
-                            let column_name = row.as_ref().column_name(col).unwrap().to_owned();
-                            let sqlite_value_ref = row.get_ref_unwrap(col);
-
-                            println!("VALUE REF {sqlite_value_ref:?}");
-                            let json_value = match sqlite_value_ref {
-                                rusqlite::types::ValueRef::Text(sqlite_value) => {
-                                    if !sqlite_value.starts_with(&[b'"'])
-                                        && !sqlite_value.starts_with(&[b'{'])
-                                        && !sqlite_value.starts_with(&[b'['])
-                                    {
-                                        serde_json::Value::from(
-                                            std::str::from_utf8(sqlite_value).unwrap(),
-                                        )
-                                    } else {
-                                        serde_json::Value::column_result(sqlite_value_ref)
-                                            .or_else(|e| {
-                                                println!("JSON ERR {e:?}");
-                                                Ok::<_, Infallible>(serde_json::Value::from(
-                                                    std::str::from_utf8(sqlite_value).unwrap(),
-                                                ))
-                                            })
-                                            .unwrap()
-                                    }
-                                }
-                                _ => serde_json::Value::column_result(sqlite_value_ref).unwrap(),
-                            };
-                            println!("JSON VALUE {json_value:?}");
-                            row_map.insert(column_name, json_value);
-                        }
-                        Ok(row_map)
-                    })
-                    .unwrap()
-                    .map(|r| r.unwrap())
-                    .collect();
+                let docs = statement.query_to_json([rowid]);
 
                 index.add_documents(&mut wtxn, docs).unwrap();
             }
@@ -199,7 +215,7 @@ impl r2d2::ManageConnection for SqliteMilliConnectionManager {
         let connection = self.inner.connect()?;
 
         let table_settings = self.table_settings.clone();
-        let pending_updates = Arc::new(RwLock::new(DashMap::new()));
+        let pending_updates = Arc::new(RwLock::new(DashMap::<_, Vec<TableUpdate>>::new()));
         let pending_updates_ = pending_updates.clone();
         connection.preupdate_hook(Some(
             move |action, db_name: &_, table_name: &_, preupdate_case: &_| {
@@ -209,14 +225,10 @@ impl r2d2::ManageConnection for SqliteMilliConnectionManager {
                     for settings in index_settings.iter() {
                         let primary_key = (settings.primary_key_fn.0)(accessor);
                         let pending_updates_read = pending_updates_.read().unwrap();
-                        let entry = pending_updates_read.entry(settings.index_name.clone());
-                        let mut index_updates = match entry {
-                            Entry::Occupied(o) => o,
-                            Entry::Vacant(vacant) => vacant.insert_entry(vec![]),
-                        };
-                        index_updates
-                            .get_mut()
-                            .push(TableUpdate::Delete { primary_key });
+                        let mut entry =
+                            pending_updates_read.get_or_insert_entry(settings.index_name.clone());
+
+                        entry.get_mut().push(TableUpdate::Delete { primary_key });
                     }
                 }
             },
@@ -230,12 +242,9 @@ impl r2d2::ManageConnection for SqliteMilliConnectionManager {
                 let index_settings = table_settings.get(table_name).unwrap();
                 for settings in index_settings.iter() {
                     let pending_updates_read = pending_updates_.read().unwrap();
-                    let entry = pending_updates_read.entry(settings.index_name.clone());
-                    let mut index_updates = match entry {
-                        Entry::Occupied(o) => o,
-                        Entry::Vacant(vacant) => vacant.insert_entry(vec![]),
-                    };
-                    index_updates.get_mut().push(TableUpdate::Upsert {
+                    let mut entry =
+                        pending_updates_read.get_or_insert_entry(settings.index_name.clone());
+                    entry.get_mut().push(TableUpdate::Upsert {
                         rowid,
                         update_query: settings.update_query.clone(),
                     });

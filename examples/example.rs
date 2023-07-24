@@ -12,7 +12,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use skald::{
     embedded_milli::{IndexSettings, Instance},
-    PrimaryKeyFn, SqliteMilliConnectionManager, TableIndexSettings,
+    PrimaryKeyFn, SqliteMilliConnectionManager, StatementExt, TableIndexSettings,
 };
 use slite::Migrator;
 
@@ -55,13 +55,30 @@ fn main() {
             },
         )
         .unwrap();
+
+    let conn = manager.connect().unwrap();
+    conn.execute("insert into artist(artist_name, created_date, extra) values('test2', DATE('now'), '{\"yo\":[true,2]}')", []).unwrap();
+    let mut statement = conn
+        .prepare("select artist_id, artist_name, extra from artist")
+        .unwrap();
+    index
+        .set_documents(&mut wtxn, statement.query_to_json([]))
+        .unwrap();
     wtxn.commit().unwrap();
+
+    let rtxn = index.read();
+    let res = index
+        .search_documents(&rtxn, |search| {
+            search.query("test2");
+        })
+        .unwrap();
+    println!("RES0 {res:?}");
 
     let manager = SqliteMilliConnectionManager::new(manager, instance).with_table(
         "artist".to_owned(),
         vec![TableIndexSettings {
             index_name: "artist".to_owned(),
-            update_query: "select artist_id, artist_name, extra from artist where rowid = ?1"
+            update_query: "select artist_id, artist_name, extra from artist where rowid = ?"
                 .to_owned(),
             primary_key_fn: PrimaryKeyFn::new(|accessor| {
                 if let ValueRef::Integer(val) = accessor.get_old_column_value(0) {
@@ -75,21 +92,24 @@ fn main() {
     let pool = Pool::new(manager).unwrap();
     let conn = pool.get().unwrap();
     conn.execute("insert into artist(artist_name, created_date, extra) values('test', DATE('now'), '{\"yo\":[true,2]}')", []).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let rtxn = index.read();
 
-    thread::sleep(Duration::from_millis(1000));
+    let res = index
+        .search_documents(&rtxn, |search| {
+            search.query("test");
+        })
+        .unwrap();
+    println!("RES1 {res:?}");
+    conn.execute("delete from artist", []).unwrap();
+    thread::sleep(Duration::from_millis(100));
     let rtxn = index.read();
     let res = index
-        .search_documents(
-            &rtxn,
-            Some("'test'".to_owned()),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        .search_documents(&rtxn, |search| {
+            search.query("test");
+        })
         .unwrap();
-    println!("RES {res:?}");
+    println!("RES2 {res:?}");
 }
 
 // SELECT 'song' || s.song_id as entry_id, s.song_title entry, 'song' as entry_type, al.album_name album, ar.artist_name artist
