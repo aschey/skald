@@ -9,11 +9,15 @@ use std::{
     time::Duration,
 };
 
-mod r2d2_adapter;
-pub use r2d2_adapter::*;
+#[cfg(feature = "deadpool")]
+pub mod deadpool;
+#[cfg(feature = "r2d2")]
+pub mod r2d2;
+#[cfg(feature = "sqlx")]
+pub mod sqlx;
 
 pub struct SqliteConnectionHandler {
-    table_settings: Arc<DashMap<String, Vec<TableIndexSettings>>>,
+    table_settings: Arc<DashMap<(String, String), Vec<TableIndexSettings>>>,
     update_tx: channel::Sender<DashMap<String, Vec<TableUpdate>>>,
     _updater_handle: JoinHandle<()>,
 }
@@ -30,9 +34,14 @@ impl SqliteConnectionHandler {
         }
     }
 
-    pub fn with_table(self, table: String, settings: Vec<TableIndexSettings>) -> Self {
+    pub fn with_table(
+        self,
+        database: String,
+        table: String,
+        settings: Vec<TableIndexSettings>,
+    ) -> Self {
         {
-            let mut index_updates = self.table_settings.get_or_insert_entry(table);
+            let mut index_updates = self.table_settings.get_or_insert_entry((database, table));
             index_updates.get_mut().extend(settings);
         }
 
@@ -44,10 +53,11 @@ impl SqliteConnectionHandler {
         let pending_updates = Arc::new(RwLock::new(DashMap::<_, Vec<TableUpdate>>::new()));
         let pending_updates_ = pending_updates.clone();
         connection.preupdate_hook(Some(
-            move |action, db_name: &_, table_name: &_, preupdate_case: &_| {
-                println!("preupdate hook {action:?} {db_name} {table_name}, {preupdate_case:?}");
+            move |_action, db_name: &str, table_name: &str, preupdate_case: &_| {
                 if let PreUpdateCase::Delete(accessor) = preupdate_case {
-                    let index_settings = table_settings.get(table_name).unwrap();
+                    let index_settings = table_settings
+                        .get(&(db_name.to_owned(), table_name.to_owned()))
+                        .unwrap();
                     for settings in index_settings.iter() {
                         let primary_key = (settings.primary_key_fn.0)(accessor);
                         let pending_updates_read = pending_updates_.read();
@@ -62,32 +72,34 @@ impl SqliteConnectionHandler {
 
         let table_settings = self.table_settings.clone();
         let pending_updates_ = pending_updates.clone();
-        connection.update_hook(Some(move |action, db_name: &_, table_name: &str, rowid| {
-            println!("update hook {action:?} {db_name} {table_name}, {rowid}");
-            if let Action::SQLITE_INSERT | Action::SQLITE_UPDATE = action {
-                let index_settings = table_settings.get(table_name).unwrap();
-                for settings in index_settings.iter() {
-                    let pending_updates_read = pending_updates_.read();
-                    let mut entry =
-                        pending_updates_read.get_or_insert_entry(settings.index_name.clone());
-                    entry.get_mut().push(TableUpdate::Upsert {
-                        rowid,
-                        update_query: settings.update_query.clone(),
-                    });
+        connection.update_hook(Some(
+            move |action, db_name: &str, table_name: &str, rowid| {
+                if let Action::SQLITE_INSERT | Action::SQLITE_UPDATE = action {
+                    let index_settings = table_settings
+                        .get(&(db_name.to_owned(), table_name.to_owned()))
+                        .unwrap();
+                    for settings in index_settings.iter() {
+                        let pending_updates_read = pending_updates_.read();
+                        let mut entry =
+                            pending_updates_read.get_or_insert_entry(settings.index_name.clone());
+                        entry.get_mut().push(TableUpdate::Upsert {
+                            rowid,
+                            update_query: settings.update_query.clone(),
+                        });
+                    }
                 }
-            }
-        }));
+            },
+        ));
+
         let pending_updates_ = pending_updates.clone();
         let update_tx = self.update_tx.clone();
         connection.commit_hook(Some(move || {
-            println!("COMMIT");
             let old = std::mem::take(&mut *pending_updates_.write());
             update_tx.send(old).unwrap();
             false
         }));
 
         connection.rollback_hook(Some(move || {
-            println!("ROLLBACK");
             pending_updates.read().clear();
         }));
     }

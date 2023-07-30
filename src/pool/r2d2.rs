@@ -18,9 +18,14 @@ impl SkaldConnectionManager {
         }
     }
 
-    pub fn with_table(self, table: String, settings: Vec<TableIndexSettings>) -> Self {
+    pub fn with_table(
+        self,
+        database: String,
+        table: String,
+        settings: Vec<TableIndexSettings>,
+    ) -> Self {
         Self {
-            handler: self.handler.with_table(table, settings),
+            handler: self.handler.with_table(database, table, settings),
             inner: self.inner,
         }
     }

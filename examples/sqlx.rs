@@ -1,37 +1,27 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs::File,
-    io::Read,
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
-
-use r2d2::{ManageConnection, Pool};
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use skald::{
     embedded_milli::{IndexSettings, Instance},
-    pool::SkaldConnectionManager,
-    PrimaryKeyFn, StatementExt, TableIndexSettings,
+    pool::sqlx::{IntoConnection, QueryExt, SkaldHooks},
+    PrimaryKeyFn, TableIndexSettings,
 };
 use slite::Migrator;
+use sqlx::{sqlite::SqlitePoolOptions, ValueRef};
+use std::{fs::File, io::Read, thread, time::Duration};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut buffer = String::new();
     File::open("./examples/artist.sql")
         .unwrap()
         .read_to_string(&mut buffer)
         .unwrap();
 
-    let manager = SqliteConnectionManager::memory().with_flags(
-        OpenFlags::default() | OpenFlags::SQLITE_OPEN_MEMORY | OpenFlags::SQLITE_OPEN_SHARED_CACHE,
-    );
-    let conn = manager.connect().unwrap();
+    let path = "sqlx.db";
+
+    let pool = sqlx::SqlitePool::connect(path).await.unwrap();
 
     let migrator = Migrator::new(
         &[buffer],
-        conn,
+        pool.into_connection().await,
         slite::Config::default(),
         slite::Options {
             allow_deletions: true,
@@ -42,6 +32,7 @@ fn main() {
     migrator.migrate().unwrap();
 
     let instance = Instance::new("./test_index");
+
     let index = instance.get_index("artist").unwrap();
     let mut wtxn = index.write();
 
@@ -57,14 +48,12 @@ fn main() {
         )
         .unwrap();
 
-    let conn = manager.connect().unwrap();
-    conn.execute("insert into artist(artist_name, created_date, extra) values('test2', DATE('now'), '{\"yo\":[true,2]}')", []).unwrap();
-    let mut statement = conn
-        .prepare("select artist_id, artist_name, extra from artist")
+    sqlx::query("insert into artist(artist_name, created_date, extra) values('test2', DATE('now'), '{\"yo\":[true,2]}')").execute(&pool).await.unwrap();
+    let res = sqlx::query("select artist_id, artist_name, extra from artist")
+        .fetch_all(&pool)
+        .await
         .unwrap();
-    index
-        .set_documents(&mut wtxn, statement.query_to_json([]))
-        .unwrap();
+    index.set_documents(&mut wtxn, res.query_to_json()).unwrap();
     wtxn.commit().unwrap();
 
     let rtxn = index.read();
@@ -75,14 +64,15 @@ fn main() {
         .unwrap();
     println!("RES0 {res:?}");
 
-    let manager = SkaldConnectionManager::new(manager, instance).with_table(
+    let hooks = SkaldHooks::new(&pool, instance).await.with_table(
+        "main".to_owned(),
         "artist".to_owned(),
         vec![TableIndexSettings {
             index_name: "artist".to_owned(),
             update_query: "select artist_id, artist_name, extra from artist where rowid = ?"
                 .to_owned(),
             primary_key_fn: PrimaryKeyFn::new(|accessor| {
-                if let ValueRef::Integer(val) = accessor.get_old_column_value(0) {
+                if let rusqlite::types::ValueRef::Integer(val) = accessor.get_old_column_value(0) {
                     val.to_string()
                 } else {
                     unreachable!()
@@ -90,9 +80,14 @@ fn main() {
             }),
         }],
     );
-    let pool = Pool::new(manager).unwrap();
-    let conn = pool.get().unwrap();
-    conn.execute("insert into artist(artist_name, created_date, extra) values('test', DATE('now'), '{\"yo\":[true,2]}')", []).unwrap();
+    let pool = SqlitePoolOptions::default()
+        .after_connect(hooks.build())
+        .connect(path)
+        .await
+        .unwrap();
+
+    sqlx::query("insert into artist(artist_name, created_date, extra) values('test', DATE('now'), '{\"yo\":[true,2]}')").execute(&pool).await.unwrap();
+
     thread::sleep(Duration::from_millis(100));
     let rtxn = index.read();
 
@@ -102,7 +97,10 @@ fn main() {
         })
         .unwrap();
     println!("RES1 {res:?}");
-    conn.execute("delete from artist", []).unwrap();
+    sqlx::query("delete from artist")
+        .execute(&pool)
+        .await
+        .unwrap();
     thread::sleep(Duration::from_millis(100));
     let rtxn = index.read();
     let res = index
